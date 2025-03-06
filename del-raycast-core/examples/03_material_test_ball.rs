@@ -1,8 +1,8 @@
+use del_geo_core::mat4_col_major;
+use del_geo_core::vec3;
+use del_geo_core::vec3::Vec3;
 use del_msh_core::search_bvh3::TriMeshWithBvh;
-use del_raycast_core::{
-    parse_pbrt,
-    textures::{CheckerBoardTexture, Texture},
-};
+use del_raycast_core::textures::Texture;
 
 struct Shape {
     vtx2xyz: Vec<f32>,
@@ -130,6 +130,8 @@ fn parse() -> anyhow::Result<(
 }
 
 fn main() -> anyhow::Result<()> {
+    dielectric_sphere();
+
     let (shapes, camera, scene) = parse()?;
     {
         let mut tri2vtx: Vec<usize> = vec![];
@@ -266,4 +268,206 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// render a sphere with dielectric material
+fn dielectric_sphere() {
+    use arrayref::array_mut_ref;
+    use del_geo_core::vec3::Vec3;
+    let res_path = "target/test_dielectric.hdr";
+    let env_map_path = "asset/material-testball/textures/envmap.pfm";
+    let (tex_shape, tex_data) = {
+        match del_raycast_core::io_pfm::PFM::read_from(env_map_path) {
+            Ok(pfm) => ((pfm.w, pfm.h), pfm.data),
+            Err(msg) => {
+                panic!("{}", msg);
+            }
+        }
+    };
+
+    let camera_fov = 20.0;
+    // let transform_cam_lcl2glbl = del_geo_core::mat4_col_major::from_translate(&[0., 0., -5.]);
+    let transform_world2camlcl: [f32; 16] = [
+        0.721367, -0.373123, -0.583445, -0., -0., 0.842456, -0.538765, -0., -0.692553, -0.388647,
+        -0.60772, -0., 0.0258668, -0.29189, 5.43024, 1.,
+    ];
+    let transform_camlcl2world =
+        del_geo_core::mat4_col_major::try_inverse(&transform_world2camlcl).unwrap();
+    let transform_env = [
+        -0.386527, 0., 0.922278, 0., -0.922278, 0., -0.386527, 0., 0., 1., 0., 0., 0., 0., 0., 1.,
+    ];
+
+    let transform_env: [f32; 16] = {
+        let m = nalgebra::Matrix4::<f32>::from_column_slice(&transform_env);
+        let m = m.try_inverse().unwrap();
+        // let transform_env = del_geo_core::mat4_col_major::try_inverse(&transform_env).unwrap();
+        m.as_slice().try_into().unwrap()
+    };
+    let sphere_cntr = [0.15, 0.50, 0.16];
+    let img_shape = (640, 360);
+    {
+        let shoot_ray = |i_pix: usize, pix: &mut [f32]| {
+            use rand::Rng;
+            use rand::SeedableRng;
+            let mut rng = rand_chacha::ChaChaRng::seed_from_u64(i_pix as u64);
+            let pix = array_mut_ref![pix, 0, 3];
+            let transforms = (
+                &transform_world2camlcl,
+                &transform_world2camlcl,
+                &transform_env,
+            );
+            let tex_info = (&tex_shape, &tex_data);
+            let nsamples = 64;
+            let mut rad = [0.; 3];
+            for _i_sample in 0..nsamples {
+                let dxdy = (
+                    del_raycast_core::sampling::tent(rng.random::<f32>()),
+                    del_raycast_core::sampling::tent(rng.random::<f32>()),
+                );
+                let (ray_org, ray_dir) = del_raycast_core::cam_pbrt::cast_ray_plus_z(
+                    (i_pix % img_shape.0, i_pix / img_shape.0),
+                    dxdy,
+                    img_shape,
+                    camera_fov,
+                    transform_camlcl2world,
+                );
+
+                rad.add_in_place(&pt_dielectric(
+                    &sphere_cntr,
+                    &ray_dir,
+                    &ray_org,
+                    transforms,
+                    tex_info,
+                    &mut rng,
+                ));
+            }
+            *pix = rad.scale(1. / nsamples as f32);
+        };
+        use rayon::iter::IndexedParallelIterator;
+        use rayon::iter::ParallelIterator;
+        use rayon::prelude::ParallelSliceMut;
+        let mut img = vec![0f32; img_shape.0 * img_shape.1 * 3];
+        img.par_chunks_mut(3)
+            .enumerate()
+            .for_each(|(i_pix, pix)| shoot_ray(i_pix, pix));
+        let _ = del_canvas::write_hdr_file(res_path, img_shape, &img);
+    }
+}
+
+fn pt_dielectric<RNG>(
+    sphere_cntr: &[f32; 3],
+    ray_dir_ini: &[f32; 3],
+    ray_org_ini: &[f32; 3],
+    transforms: (&[f32; 16], &[f32; 16], &[f32; 16]),
+    tex_info: (&(usize, usize), &Vec<f32>),
+    rng: &mut RNG,
+) -> [f32; 3]
+where
+    RNG: rand::Rng,
+{
+    use del_raycast_core::material;
+
+    let max_depth = 65;
+    let w2c = transforms.0;
+    let c2w = transforms.1;
+    let transform_env = transforms.2;
+    let tex_shape = tex_info.0;
+    let tex_data = tex_info.1;
+    let mut ray_org: [f32; 3] = ray_org_ini.to_owned();
+    let mut ray_dir: [f32; 3] = ray_dir_ini.to_owned();
+
+    let mut ior = 1.5; // index of refraction of glass
+    let uroughness = 1e-4; // small value <1e-3 for smooth suface
+    let vroughness = 1e-4;
+
+    let mut rad_out = [0.; 3];
+    let mut throughput = [1.; 3];
+
+    for i_depth in 0..max_depth {
+        let hit = intersect_sphere_with_normal(0.7, sphere_cntr, &ray_org, &ray_dir);
+        if hit.is_none() {
+            let nrm = vec3::normalize(&ray_dir);
+            let env = mat4_col_major::transform_homogeneous(transform_env, &nrm).unwrap();
+            let tex_coord = del_geo_core::uvec3::map_to_unit2_equal_area(&env);
+
+            let color = del_canvas::texture::nearest_integer_center::<3>(
+                &[
+                    tex_coord[0] * tex_shape.0 as f32,
+                    tex_coord[1] * tex_shape.1 as f32,
+                ],
+                tex_shape,
+                tex_data,
+            );
+
+            let contribution = throughput.element_wise_mult(&color);
+            rad_out = vec3::add(&rad_out, &contribution);
+            break;
+        }
+        let (hit_pos, hit_nrm) = hit.unwrap();
+
+        let entering = vec3::dot(&ray_dir, &hit_nrm) < 0.0;
+        let hit_nrm = if entering {
+            hit_nrm
+        } else {
+            //ray exiting sphere, normal point to sphere's center
+            hit_nrm.scale(-1.0)
+        };
+
+        let wo = vec3::normalize(&ray_dir);
+        ior = if entering { 1. / ior } else { ior };
+        if let Some((wi, brdf, pdf)) = material::sample_brdf_dielectric(
+            &wo,
+            &[0.243117, 0.059106, 0.000849],
+            &[ior; 3],
+            uroughness,
+            vroughness,
+            rng,
+        ) {
+            let cos_hit = wi.dot(&hit_nrm).abs();
+            throughput = throughput.element_wise_mult(&brdf.scale(cos_hit / pdf));
+
+            if i_depth > 2 {
+                // russian roulette
+                let &russian_roulette_prob = throughput
+                    .iter()
+                    .max_by(|&a, &b| a.partial_cmp(b).unwrap())
+                    .unwrap();
+                if rng.random::<f32>() < russian_roulette_prob {
+                    throughput = vec3::scale(&throughput, 1.0 / russian_roulette_prob);
+                } else {
+                    break; // terminate ray
+                }
+            }
+
+            ray_dir = wi;
+            ray_org = vec3::axpy(1e-4, &wi, &hit_pos); //offset
+        } else {
+            // internal reflection
+            let reflected = vec3::mirror_reflection(&ray_dir, &hit_nrm);
+            ray_dir = reflected;
+            ray_org = vec3::axpy(1e-4, &reflected, &hit_pos);
+        };
+    }
+    rad_out
+}
+
+/// get hit position and normal
+fn intersect_sphere_with_normal(
+    radius: f32,
+    sphere_cntr: &[f32; 3],
+    ray_org: &[f32; 3],
+    ray_dir: &[f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    let hit = del_geo_core::sphere::intersection_ray(radius, sphere_cntr, ray_org, ray_dir);
+    if hit.is_none() {
+        None
+    } else {
+        let hit_pos = vec3::axpy::<f32>(hit.unwrap(), ray_dir, ray_org);
+        let hit_nrm = {
+            let nrm_dir = vec3::sub(&hit_pos, sphere_cntr);
+            vec3::normalize(&nrm_dir)
+        };
+
+        Some((hit_pos, hit_nrm))
+    }
 }

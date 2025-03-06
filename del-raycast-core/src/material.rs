@@ -209,9 +209,9 @@ pub fn eval_brdf_rough_conductor(
 
 #[allow(unused_variables)]
 pub fn sample_brdf_dielectric<RNG>(
-    wi: &[f32; 3],
+    wo: &[f32; 3],
     reflectance: &[f32; 3],
-    eta: &[f32; 3],
+    etas: &[f32; 3],
     uroughness: f32,
     vroughness: f32,
     rng: &mut RNG,
@@ -219,63 +219,126 @@ pub fn sample_brdf_dielectric<RNG>(
 where
     RNG: rand::Rng,
 {
+    let constant_etas = {
+        let mut equals = true;
+        for i in 1..3 {
+            if etas[i] != etas[i - 1] {
+                equals = false;
+                break;
+            }
+        }
+        equals
+    };
+
+    let (pdf_spectral, eta) = {
+        let mut pdf = 1.;
+        let mut eta = etas[0];
+        if !constant_etas {
+            pdf = 1. / 3.; // boost selected
+            eta = etas[rng.random_range(0..3)];
+        }
+        (pdf, eta)
+    };
+
     let smooth = |x: f32, y: f32| x.max(y) < 1e-3;
     // specular
-    if eta.iter().all(|&x| x == 1.) || (smooth(uroughness, vroughness)) {
-        let cos_theta_i = wi[2];
-        // reflectance
-        let r = fresnel_dielectric_reflectance_rgb(eta, cos_theta_i);
+    if eta == 1. || (smooth(uroughness, vroughness)) {
+        let cos_theta_i = wo[2];
+        let r = fresnel_dielectric_reflectance(eta, cos_theta_i);
         // transmission
-        let t = [1. - r[0], 1. - r[1], 1. - r[2]];
-
+        let t = 1. - r;
+        // enhacement todo: choose sampling reflection or transmission
         let pr = r;
         let pt = t;
 
-        let rdms = [
-            rng.random::<f32>(),
-            rng.random::<f32>(),
-            rng.random::<f32>(),
-        ];
-        //TODO: sample btdf or brdf
+        let rdm = rng.random::<f32>();
+
+        if rdm < (pr / (pr + pt)) {
+            let wo = [-wo[0], -wo[1], wo[2]];
+            let brdf = r / cos_theta_i.abs(); // perfect specular brdf
+            let pdf = pr / (pr + pt);
+            Some((wo, [brdf; 3], pdf * pdf_spectral))
+        } else {
+            if let Some((wt, eta)) = refract(wo, &[0., 0., 1.], eta) {
+                let mut brdf = t / cos_theta_i.abs();
+                // https://pbr-book.org/4ed/Reflection_Models/Dielectric_BSDF#eq:transmitted-radiance-change
+                brdf /= eta * eta;
+                let pdf = pt / (pr + pt);
+                return Some((wt, [brdf; 3], pdf * pdf_spectral));
+            }
+            None // can not be refracted
+        }
     } else {
         // TODO: roughness sampling
+        todo!();
     }
-    todo!();
 }
 
-pub fn fresnel_dielectric_reflectance_rgb(eta: &[f32; 3], mut cos_theta_i: f32) -> [f32; 3] {
-    cos_theta_i = cos_theta_i.clamp(-1., 1.);
-    let mut eta_local = *eta;
-    // potential filp
-    if cos_theta_i < 0. {
-        cos_theta_i = -cos_theta_i;
-        eta_local = [1. / eta[0], 1. / eta[1], 1. / eta[2]];
+#[allow(unused_variables)]
+pub fn eval_brdf_dielectric(
+    wi: &[f32; 3],
+    wo: &[f32; 3],
+    reflectance: &[f32; 3],
+    etas: &[f32; 3],
+    uroughness: f32,
+    vroughness: f32,
+) -> [f32; 3] {
+    let smooth = |x: f32, y: f32| x.max(y) < 1e-3;
+    let debug = true;
+    // specular
+    if debug || (smooth(uroughness, vroughness)) {
+        return [0.; 3];
     }
 
-    let sqr_sin_theta_i = (1. - cos_theta_i * cos_theta_i).sqrt();
-    let cos_theta_t: Vec<f32> = eta_local
-        .iter()
-        .map(|i_eta| {
-            let sqr_eta = i_eta * i_eta;
-            (1. - sqr_sin_theta_i / sqr_eta).sqrt()
-        })
-        .collect();
+    todo!()
+}
 
-    [
-        fresnel_dielectric_reflectance(eta_local[0], cos_theta_i, cos_theta_t[0]),
-        fresnel_dielectric_reflectance(eta_local[1], cos_theta_i, cos_theta_t[1]),
-        fresnel_dielectric_reflectance(eta_local[2], cos_theta_i, cos_theta_t[2]),
-    ]
+/// return refracted direction, eta(could be updated)
+pub fn refract(wi: &[f32; 3], n: &[f32; 3], eta: f32) -> Option<([f32; 3], f32)> {
+    use del_geo_core::vec3::Vec3;
+    let (cos_theta_i, eta, n) = {
+        let mut cos_theta = wi.dot(n);
+        let mut eta = eta;
+        let mut n = *n;
+        // switch directions
+        if cos_theta < 0. {
+            eta = 1. / eta;
+            cos_theta = -cos_theta;
+            n.scale_in_place(-1.);
+        }
+        (cos_theta, eta, n)
+    };
+
+    let cos_theta_t = {
+        let sqr_sin_theta_i = (1. - cos_theta_i * cos_theta_i).sqrt();
+        let sqr_sin_theta_t = sqr_sin_theta_i / (eta * eta);
+        if sqr_sin_theta_t >= 1. {
+            return None;
+        }
+        (1. - sqr_sin_theta_t).sqrt()
+    };
+
+    let wt = wi
+        .scale(-1. / eta)
+        .add(&n.scale(cos_theta_i / eta - cos_theta_t));
+
+    Some((wt, eta))
 }
 
 // <https://pbr-book.org/4ed/Reflection_Models/Specular_Reflection_and_Transmission.html#FrDielectric >
-pub fn fresnel_dielectric_reflectance(mut eta: f32, mut cos_theta_i: f32, cos_theta_t: f32) -> f32 {
+pub fn fresnel_dielectric_reflectance(mut eta: f32, mut cos_theta_i: f32) -> f32 {
     cos_theta_i = cos_theta_i.clamp(-1., 1.);
     // potential filp
     if cos_theta_i < 0. {
         eta = 1. / eta;
         cos_theta_i = -cos_theta_i;
     }
+
+    let cos_theta_t = {
+        let sqr_sin_theta_i = (1. - cos_theta_i * cos_theta_i).sqrt();
+        let sqr_eta = eta * eta;
+        (1. - sqr_sin_theta_i / sqr_eta).sqrt()
+    };
 
     let r_parl = (eta * cos_theta_i - cos_theta_t) / (eta * cos_theta_i + cos_theta_t);
     let r_perp = (cos_theta_i - eta * cos_theta_t) / (cos_theta_i + eta * cos_theta_t);
